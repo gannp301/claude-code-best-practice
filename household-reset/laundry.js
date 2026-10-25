@@ -188,6 +188,17 @@
     return moved;
   }
 
+  // Finished loads not put away whose finish date is BEFORE the current
+  // cleaning week (`weekStart` is that week's Saturday). Calculated each time
+  // from the loads themselves, so there are no extra records to go stale:
+  // marking the load put away clears it. Only loads still on the board count
+  // (cleared loads are always put away). Oldest first.
+  function overduePutAway(laundry, weekStart) {
+    return laundry.loads.filter(function (l) {
+      return l.stage === 'finished' && !l.putAway && l.finishedOn && l.finishedOn < weekStart;
+    }).sort(function (a, b) { return a.finishedOn < b.finishedOn ? -1 : a.finishedOn > b.finishedOn ? 1 : 0; });
+  }
+
   function loadsNeedingPutAway(laundry) {
     return laundry.loads.filter(function (l) { return l.stage === 'finished' && !l.putAway; });
   }
@@ -217,6 +228,20 @@
     };
   }
 
+  // One short status line for the Laundry room: what needs putting away
+  // first, then what's still moving. Laundry is a workflow, not a scheduled
+  // chore, so this replaces the "N of M done" percentage. "Nothing needs
+  // putting away" never hides loads that are waiting, washing, or drying.
+  function statusLine(laundry) {
+    var c = counts(laundry);
+    var parts = [c.needPutAway ? c.needPutAway + (c.needPutAway === 1 ? ' load' : ' loads') + ' to put away'
+      : 'Nothing needs putting away'];
+    if (c.waiting) parts.push(c.waiting + ' waiting');
+    if (c.inWasher) parts.push(c.inWasher + ' washing');
+    if (c.inDryer) parts.push(c.inDryer + ' drying');
+    return parts.join(' · ');
+  }
+
   global.HouseholdLaundry = {
     STAGES: STAGES,
     STAGE_LABELS: STAGE_LABELS,
@@ -233,7 +258,9 @@
     deleteLoad: deleteLoad,
     clearPutAway: clearPutAway,
     loadsNeedingPutAway: loadsNeedingPutAway,
+    overduePutAway: overduePutAway,
     finishedBetween: finishedBetween,
-    counts: counts
+    counts: counts,
+    statusLine: statusLine
   };
 })(typeof window !== 'undefined' ? window : globalThis);

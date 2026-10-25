@@ -17,6 +17,7 @@
   var H = window.HouseholdStorage;
   var P = window.HouseholdPrep;
   var R = window.HouseholdReview;
+  var SUP = window.HouseholdSupplies;
 
   var state = null;
   // 'ok'          saving normally
@@ -31,6 +32,7 @@
   var openRoom = null; // id of the room being shown, or null for the list of rooms
   var expanded = null; // which chore row has its extra buttons showing
   var editingTask = null; // id of the room chore being edited
+  var editingFrom = null; // set when editing from a checklist row ("taskId|week")
   var editingLoad = null; // id of the laundry load being renamed
   var editing = null; // supplies/cats row being edited: { list: 'supplies', id: '...' }
   var laundryMessage = '';
@@ -265,6 +267,7 @@
     soon: { icon: '◷', className: 'hu-soon' }
   };
   var openHeadsUp = {}; // which groups you've expanded (kept while the app is open)
+  var openHeadsUpRooms = {}; // which room sections inside them you've expanded
 
   // "2 monthly · 1 every 2 weeks"
   function frequencyBreakdown(items) {
@@ -305,10 +308,9 @@
     var li = el('li', 'hu-item');
     li.appendChild(el('span', 'hu-item-name', item.task.name));
     var badges = el('span', 'badges');
-    badges.appendChild(el('span', 'badge', roomName(item.task.room)));
     badges.appendChild(freqBadge(item.task.frequency));
-    if (kind === 'overdue') badges.appendChild(el('span', 'badge status-overdue', 'Overdue from ' + S.formatShort(item.week)));
-    else if (item.effectiveWeek !== item.week) badges.appendChild(el('span', 'badge status-moved', 'Moved from week of ' + S.formatShort(item.week)));
+    if (kind === 'overdue') badges.appendChild(el('span', 'badge status-overdue', 'Overdue'));
+    else if (item.effectiveWeek !== item.week) badges.appendChild(el('span', 'badge status-moved', 'Moved to ' + S.formatShort(item.effectiveWeek)));
     li.appendChild(badges);
     if (item.note) li.appendChild(el('p', 'hu-note', 'Note: ' + item.note));
     return li;
@@ -354,10 +356,26 @@
       summary.appendChild(toggle);
       details.appendChild(summary);
 
-      var items = el('ul', 'hu-items');
-      group.items.slice(0, 25).forEach(function (item) { items.appendChild(headsUpItem(item, group.kind)); });
-      if (group.items.length > 25) items.appendChild(el('li', 'hint', 'and ' + (group.items.length - 25) + ' more'));
-      details.appendChild(items);
+      // Inside each reminder, one collapsible section per room that has any.
+      var rooms = el('div', 'hu-rooms');
+      S.ROOMS.forEach(function (room) {
+        var inRoom = group.items.filter(function (i) { return i.task.room === room.id; });
+        if (!inRoom.length) return;
+        var key = group.kind + '|' + room.id;
+        var roomBox = el('details', 'hu-room');
+        roomBox.open = !!openHeadsUpRooms[key];
+        var roomSummary = el('summary', 'hu-room-summary');
+        roomSummary.appendChild(el('span', 'hu-room-name', room.icon + ' ' + room.name));
+        roomSummary.appendChild(el('span', 'hu-room-count', String(inRoom.length)));
+        roomSummary.setAttribute('aria-label', room.name + ', ' + count(inRoom.length, 'chore', 'chores'));
+        roomBox.appendChild(roomSummary);
+        var items = el('ul', 'hu-items');
+        inRoom.forEach(function (item) { items.appendChild(headsUpItem(item, group.kind)); });
+        roomBox.appendChild(items);
+        roomBox.addEventListener('toggle', function () { openHeadsUpRooms[key] = roomBox.open; });
+        rooms.appendChild(roomBox);
+      });
+      details.appendChild(rooms);
       details.addEventListener('toggle', function () {
         openHeadsUp[group.kind] = details.open;
         toggle.textContent = details.open ? 'Hide details' : 'Show details';
@@ -368,14 +386,23 @@
     box.appendChild(list);
   }
 
-  function laundrySummary() {
-    var c = W.counts(state.laundry);
-    var parts = [];
-    if (c.waiting) parts.push(c.waiting + ' waiting');
-    if (c.inWasher) parts.push('washing');
-    if (c.inDryer) parts.push('drying');
-    if (c.needPutAway) parts.push(c.needPutAway + ' to put away');
-    return parts.length ? parts.join(' · ') : 'No loads in progress';
+  // Which cleaning week laundry put-away reminders are measured against.
+  // Laundry isn't saved per week, so it always shows today's real loads:
+  //  - this week or a past week: loads finished before THIS week and not
+  //    put away are overdue;
+  //  - a future week: those, plus loads that would still be waiting by then
+  //    ("Not put away yet"). Looking ahead never marks anything overdue.
+  function laundryWeek() {
+    var cw = currentWeek();
+    return selectedWeek > cw ? selectedWeek : cw;
+  }
+
+  // Laundry's status line, plus any chores you added to the Laundry room
+  // yourself (as text only: laundry has no percentage bar).
+  function laundrySummary(progress) {
+    var text = W.statusLine(state.laundry) +
+      (progress.total ? ' · ' + progress.done + ' of ' + progress.total + ' chores done' : '');
+    return text.replace(/(\d) /g, '$1\u00a0'); // keep "1 waiting" together when it wraps
   }
 
   function renderRoomGrid() {
@@ -399,15 +426,19 @@
 
       var meta;
       if (room.id === 'laundry') {
-        meta = laundrySummary() + (progress.total ? ' · ' + progress.done + ' of ' + progress.total + ' chores' : '');
+        meta = laundrySummary(progress);
       } else if (before) {
         meta = 'Not tracked this week';
       } else {
         meta = progress.total ? progress.done + ' of ' + progress.total + ' done' : 'Nothing due this week';
       }
       card.appendChild(el('span', 'room-meta', meta));
-      card.appendChild(miniProgress(progress.percent));
+      if (room.id !== 'laundry') card.appendChild(miniProgress(progress.percent));
       if (overdue) card.appendChild(el('span', 'chip chip-overdue', '⚠ ' + overdue + ' overdue'));
+      if (room.id === 'laundry') {
+        var lateLoads = W.overduePutAway(state.laundry, laundryWeek()).length;
+        if (lateLoads) card.appendChild(el('span', 'chip chip-overdue', '⚠ ' + count(lateLoads, 'load', 'loads') + ' to put away from earlier weeks'));
+      }
       card.setAttribute('aria-label', room.name + ': ' + meta + (overdue ? ', ' + overdue + ' overdue' : ''));
       grid.appendChild(card);
     });
@@ -573,24 +604,25 @@
     return o.task.id + '|' + o.week;
   }
 
+  // Short status labels only. The original scheduled week is still stored
+  // (History and overdue rules use it); the checklist doesn't repeat it.
   function statusBadges(o) {
     var badges = [];
+    var moved = o.effectiveWeek !== o.week;
     if (o.status === 'done') {
-      var late = o.record.completedOn > S.weekEnd(o.effectiveWeek);
-      badges.push(el('span', 'badge status-done', '✓ Done ' + S.formatShort(o.record.completedOn) + (late ? ' (late)' : '')));
+      badges.push(el('span', 'badge status-done', '✓ Done ' + S.formatShort(o.record.completedOn)));
     } else if (o.status === 'skipped') {
-      badges.push(el('span', 'badge status-skipped', '⤼ Skipped'));
+      // Saved by an older version, when Skip meant "dismiss". Kept as it was.
+      badges.push(el('span', 'badge status-skipped', 'Skipped (dismissed)'));
     } else if (o.status === 'overdue') {
-      badges.push(el('span', 'badge status-overdue', '⚠ Overdue from ' + S.formatShort(o.week)));
+      badges.push(el('span', 'badge status-overdue', '⚠ Overdue'));
+    } else if (moved) {
+      badges.push(el('span', 'badge status-moved', 'Moved to ' + S.formatShort(o.effectiveWeek)));
     } else if (o.status === 'due' && o.effectiveWeek < selectedWeek) {
-      // Shown in a future week's list: still open now, not overdue yet.
-      badges.push(el('span', 'badge status-upcoming', '◷ Open from ' + S.formatShort(o.week) +
-        ' · overdue after ' + S.formatShort(S.weekEnd(o.effectiveWeek))));
-    } else if (o.status === 'upcoming') {
-      badges.push(el('span', 'badge status-upcoming', '◷ Upcoming'));
+      badges.push(el('span', 'badge status-upcoming', 'Due this week'));
     }
-    if (o.effectiveWeek !== o.week && o.status !== 'overdue') {
-      badges.push(el('span', 'badge status-moved', '→ Moved from week of ' + S.formatShort(o.week)));
+    if (o.deferred && !moved && o.status !== 'done' && o.status !== 'skipped') {
+      badges.push(el('span', 'badge status-skipped', 'Skipped for now'));
     }
     return badges;
   }
@@ -614,6 +646,13 @@
     var done = o.status === 'done';
     var li = el('li', 'item task-row freq-' + o.task.frequency + ' status-' + o.status + (done ? ' done' : ''));
     var data = { task: o.task.id, week: o.week };
+
+    // Editing this chore from the checklist (More → Edit chore).
+    if (editingTask === o.task.id && editingFrom === occurrenceKey(o)) {
+      li.appendChild(el('p', 'edit-heading', 'Edit chore: ' + o.task.name));
+      li.appendChild(renderTaskForm(o.task));
+      return li;
+    }
 
     var check = button('toggle-done', done ? '✓' : '', 'check', data);
     check.className = 'check';
@@ -647,12 +686,23 @@
 
     if (isOpen) {
       var actions = el('div', 'row-actions');
-      actions.appendChild(button('skip', o.status === 'skipped' ? 'Undo skip' : 'Skip this week', 'btn-quiet', data));
-      if (!done) {
-        var moveWrap = el('div', 'move-wrap');
-        moveWrap.appendChild(moveSelect(o));
-        moveWrap.appendChild(button('move', 'Move', 'btn-quiet', data));
-        actions.appendChild(moveWrap);
+      var editChore = button('edit-task-inline', 'Edit chore', 'btn-quiet', data);
+      editChore.setAttribute('aria-label', 'Edit chore "' + o.task.name + '" (name, frequency, supplies)');
+      actions.appendChild(editChore);
+      var skippedNow = o.deferred && !done && o.status !== 'skipped';
+      if (o.status === 'skipped') {
+        // An older "dismissed" skip: reopening it is your choice.
+        actions.appendChild(button('undo-old-skip', 'Undo skip (reopen)', 'btn-quiet', data));
+      } else if (!done && !o.deferred) {
+        actions.appendChild(button('skip-now', 'Skip for now', 'btn-quiet', data));
+      }
+      li.appendChild(actions);
+      if (!skippedNow && !note) return li;
+
+      // Shown after "Skip for now" (or when this occurrence already has a note).
+      var more = el('div', 'skip-panel');
+      if (skippedNow) {
+        more.appendChild(el('p', 'hint', 'Skipped for now: it stays unfinished and becomes overdue if its week ends.'));
       }
       // A note for this occurrence only (it stays in History).
       var noteWrap = el('div', 'note-wrap');
@@ -661,14 +711,22 @@
       noteInput.className = 'note-input';
       noteInput.maxLength = 200;
       noteInput.value = note;
-      noteInput.placeholder = 'Note (optional), e.g. "No trash bags"';
+      noteInput.placeholder = 'Reason or note (optional)';
       noteInput.setAttribute('aria-label', 'Note for "' + o.task.name + '" (week of ' + S.formatShort(o.week) + ')');
       noteWrap.appendChild(noteInput);
       noteWrap.appendChild(button('save-note', note ? 'Save note' : 'Add note', 'btn-quiet', data));
       if (note) noteWrap.appendChild(button('clear-note', 'Clear note', 'btn-small', data));
-      actions.appendChild(noteWrap);
-      actions.appendChild(renderSupplyAdder(o.task, 'room:' + occurrenceKey(o)));
-      li.appendChild(actions);
+      more.appendChild(noteWrap);
+      if (skippedNow) {
+        more.appendChild(renderSupplyAdder(o.task, 'room:' + occurrenceKey(o)));
+        var moveWrap = el('div', 'move-wrap');
+        moveWrap.appendChild(el('span', 'move-label', 'Move to another cleaning week:'));
+        moveWrap.appendChild(moveSelect(o));
+        moveWrap.appendChild(button('move', 'Move', 'btn-quiet', data));
+        more.appendChild(moveWrap);
+        more.appendChild(button('undo-skip-now', 'Undo Skip', 'btn-quiet', data));
+      }
+      li.appendChild(more);
     }
     return li;
   }
@@ -753,7 +811,7 @@
     supplies.setAttribute('aria-label', 'Supplies this chore needs (optional, separate with commas)');
     form.appendChild(supplies);
 
-    var submit = el('button', 'btn btn-primary', task ? 'Save' : 'Add');
+    var submit = el('button', 'btn btn-primary', task ? 'Save Changes' : 'Add');
     submit.type = 'submit';
     form.appendChild(submit);
     if (task) form.appendChild(button('cancel-edit', 'Cancel', 'btn-quiet'));
@@ -761,39 +819,60 @@
     return form;
   }
 
+  var openFreqGroups = {}; // which frequency groups you've opened, per room (screen only)
+
+  function renderManageRow(task) {
+    var li = el('li', 'item manage-row freq-' + task.frequency);
+    if (editingTask === task.id && !editingFrom) {
+      li.appendChild(renderTaskForm(task));
+      return li;
+    }
+    var body = el('div', 'item-body');
+    body.appendChild(el('span', 'item-name', task.name));
+    var badges = el('span', 'badges');
+    var next = S.nextDueWeek(state, task, today());
+    if (next) badges.appendChild(el('span', 'badge', 'Next due ' + S.formatShort(next)));
+    if (task.supplies && task.supplies.length) badges.appendChild(el('span', 'badge', 'Needs: ' + task.supplies.join(', ')));
+    body.appendChild(badges);
+    var actions = el('div', 'item-actions');
+    var edit = button('edit-task', 'Edit', 'btn-small', { task: task.id });
+    edit.setAttribute('aria-label', 'Edit "' + task.name + '"');
+    var del = button('delete-task', 'Delete', 'btn-small btn-danger', { task: task.id });
+    del.setAttribute('aria-label', 'Delete "' + task.name + '"');
+    actions.appendChild(edit);
+    actions.appendChild(del);
+    li.appendChild(body);
+    li.appendChild(actions);
+    return li;
+  }
+
+  // One collapsible section per frequency (empty ones are left out). Several
+  // can be open at once.
   function renderManageList(roomId) {
-    var ul = el('ul', 'item-list');
-    var tasks = state.tasks.filter(function (t) { return t.room === roomId; }).sort(function (a, b) {
-      return S.FREQUENCIES[a.frequency].order - S.FREQUENCIES[b.frequency].order;
+    var wrap = el('div', 'freq-groups');
+    var tasks = state.tasks.filter(function (t) { return t.room === roomId; });
+    if (!tasks.length) {
+      wrap.appendChild(el('p', 'empty', 'No chores in this room yet. Add one above.'));
+      return wrap;
+    }
+    Object.keys(S.FREQUENCIES).forEach(function (f) {
+      var group = tasks.filter(function (t) { return t.frequency === f; });
+      if (!group.length) return;
+      var key = roomId + '|' + f;
+      var details = el('details', 'freq-group freq-' + f);
+      var editingHere = group.some(function (t) { return t.id === editingTask && !editingFrom; });
+      details.open = !!openFreqGroups[key] || editingHere;
+      var summary = el('summary', 'freq-group-summary');
+      summary.appendChild(freqBadge(f));
+      summary.appendChild(el('span', 'freq-group-count', count(group.length, 'chore', 'chores')));
+      details.appendChild(summary);
+      var ul = el('ul', 'item-list');
+      group.forEach(function (task) { ul.appendChild(renderManageRow(task)); });
+      details.appendChild(ul);
+      details.addEventListener('toggle', function () { openFreqGroups[key] = details.open; });
+      wrap.appendChild(details);
     });
-    if (!tasks.length) ul.appendChild(el('li', 'empty', 'No chores in this room yet. Add one above.'));
-    tasks.forEach(function (task) {
-      var li = el('li', 'item manage-row freq-' + task.frequency);
-      if (editingTask === task.id) {
-        li.appendChild(renderTaskForm(task));
-        ul.appendChild(li);
-        return;
-      }
-      var body = el('div', 'item-body');
-      body.appendChild(el('span', 'item-name', task.name));
-      var badges = el('span', 'badges');
-      badges.appendChild(freqBadge(task.frequency));
-      var next = S.nextDueWeek(state, task, today());
-      if (next) badges.appendChild(el('span', 'badge', 'Next due ' + S.formatShort(next)));
-      if (task.supplies && task.supplies.length) badges.appendChild(el('span', 'badge', 'Needs: ' + task.supplies.join(', ')));
-      body.appendChild(badges);
-      var actions = el('div', 'item-actions');
-      var edit = button('edit-task', 'Edit', 'btn-small', { task: task.id });
-      edit.setAttribute('aria-label', 'Edit "' + task.name + '"');
-      var del = button('delete-task', 'Delete', 'btn-small btn-danger', { task: task.id });
-      del.setAttribute('aria-label', 'Delete "' + task.name + '"');
-      actions.appendChild(edit);
-      actions.appendChild(del);
-      li.appendChild(body);
-      li.appendChild(actions);
-      ul.appendChild(li);
-    });
-    return ul;
+    return wrap;
   }
 
   function renderRoomView() {
@@ -805,9 +884,17 @@
     var before = selectedWeek < state.activatedWeek;
 
     document.getElementById('room-title').textContent = room.icon + ' ' + room.name;
-    document.getElementById('room-progress-text').textContent = before ? 'Not tracked'
+    var isLaundry = room.id === 'laundry';
+    // Laundry loads aren't saved per week, so its status is always today's.
+    document.getElementById('room-progress-text').textContent = isLaundry ? laundrySummary(progress)
+      : before ? 'Not tracked'
       : progress.total ? progress.done + ' of ' + progress.total + ' done (' + progress.percent + '%)' : 'Nothing due';
+    document.getElementById('room-progress-bar').hidden = isLaundry;
     setProgress('room-progress-bar', 'room-progress-fill', progress.percent);
+    var lateNote = document.getElementById('laundry-late-note');
+    var late = isLaundry ? W.overduePutAway(state.laundry, cw).length : 0;
+    lateNote.hidden = !late;
+    lateNote.textContent = late ? '⚠ ' + count(late, 'load', 'loads') + ' from an earlier week still to put away' : '';
 
     var content = document.getElementById('room-content');
     content.textContent = '';
@@ -820,19 +907,18 @@
     if (selectedWeek === cw) {
       var overdue = S.overdueOccurrences(state, room.id, t);
       if (overdue.length) {
-        var od = sectionBlock('Overdue (carried over)', 'Unfinished chores from earlier weeks. They keep their original due date until you finish them.');
+        var od = sectionBlock('Overdue', 'Unfinished chores from earlier weeks, including ones you skipped for now. They stay until you finish them.');
         od.classList.add('overdue-section');
         var odList = el('ul', 'item-list');
         overdue.forEach(function (o) { odList.appendChild(renderOccurrence(o)); });
         od.appendChild(odList);
-        od.appendChild(button('skip-all', 'Skip all overdue in this room', 'btn-quiet'));
         content.appendChild(od);
       }
     } else if (selectedWeek > cw) {
       var open = S.openBefore(state, room.id, selectedWeek, t);
       if (open.length) {
-        var ob = sectionBlock('Still open from earlier weeks', 'If these aren\'t done before ' + S.formatRangeShort(selectedWeek) +
-          ', they\'ll carry over into it as overdue. Looking ahead doesn\'t change anything.');
+        var ob = sectionBlock('Still open now', 'Not done yet. If they\'re still open when ' + S.formatRangeShort(selectedWeek) +
+          ' arrives, they\'ll be overdue then. Looking ahead doesn\'t change anything.');
         ob.classList.add('carry-preview');
         var obList = el('ul', 'item-list');
         open.forEach(function (o) { obList.appendChild(renderOccurrence(o)); });
@@ -846,12 +932,17 @@
     var due = sectionBlock(title);
     if (before) {
       due.appendChild(el('p', 'empty', 'This week is before room schedules started, so there is nothing to tick here.'));
-    } else if (!occurrences.length) {
-      due.appendChild(el('p', 'empty', 'No scheduled chores in this room this week.'));
     } else {
-      var list = el('ul', 'item-list');
-      occurrences.forEach(function (o) { list.appendChild(renderOccurrence(o)); });
-      due.appendChild(list);
+      // Chores moved out of this week are listed too (labelled "Moved to …"),
+      // so they don't silently disappear. Each is still one occurrence.
+      var movedAway = S.movedOut(state, room.id, selectedWeek, t).filter(function (o) { return o.status !== 'done'; });
+      if (!occurrences.length && !movedAway.length) {
+        due.appendChild(el('p', 'empty', 'No scheduled chores in this room this week.'));
+      } else {
+        var list = el('ul', 'item-list');
+        occurrences.concat(movedAway).forEach(function (o) { list.appendChild(renderOccurrence(o)); });
+        due.appendChild(list);
+      }
     }
     content.appendChild(due);
 
@@ -933,6 +1024,14 @@
     if (load.stage === 'dryer' && load.dryCycles > 1) info += ' · drying cycle ' + load.dryCycles;
     if (load.stage === 'finished') info += ' ' + S.formatShort(load.finishedOn) + (load.putAway ? ' · put away' : ' · needs putting away');
     li.appendChild(el('p', 'load-info', info));
+    if (load.stage === 'finished' && !load.putAway && load.finishedOn < laundryWeek()) {
+      if (load.finishedOn < currentWeek()) {
+        li.className += ' load-overdue';
+        li.appendChild(el('p', 'badge status-overdue load-overdue-label', '⚠ Overdue · put away (finished ' + S.formatShort(load.finishedOn) + ')'));
+      } else {
+        li.appendChild(el('p', 'badge status-upcoming load-overdue-label', 'Not put away yet (finished ' + S.formatShort(load.finishedOn) + ')'));
+      }
+    }
 
     var actions = el('div', 'load-actions');
     if (NEXT_STEP[load.stage]) actions.appendChild(stepButton(load, NEXT_STEP[load.stage][0], NEXT_STEP[load.stage][1], 'btn-primary'));
@@ -1023,10 +1122,20 @@
     });
     wrap.appendChild(board);
 
-    var finished = state.laundry.loads.filter(function (l) { return l.stage === 'finished'; });
+    var late = W.overduePutAway(state.laundry, laundryWeek());
+    var finished = state.laundry.loads.filter(function (l) { return l.stage === 'finished' && late.indexOf(l) === -1; });
     var put = sectionBlock('Put away laundry', 'Finished loads waiting to be folded and put away. Putting away doesn\'t change whether a load is finished.');
+    if (late.length) {
+      // Loads finished in an earlier week and still not put away: they stay
+      // here, labelled with their week, until you mark them put away.
+      put.appendChild(el('h4', 'category-title overdue-title', '⚠ From earlier weeks (' + late.length + ')'));
+      var lateList = el('ul', 'load-list');
+      late.forEach(function (load) { lateList.appendChild(renderLoad(load)); });
+      put.appendChild(lateList);
+      put.appendChild(el('h4', 'category-title', 'This week'));
+    }
     var putList = el('ul', 'load-list');
-    if (!finished.length) putList.appendChild(el('li', 'empty', 'No finished loads right now.'));
+    if (!finished.length) putList.appendChild(el('li', 'empty', late.length ? 'Nothing else to put away.' : 'No finished loads right now.'));
     finished.sort(function (a, b) { return Number(a.putAway) - Number(b.putAway); })
       .forEach(function (load) { putList.appendChild(renderLoad(load)); });
     put.appendChild(putList);
@@ -1037,15 +1146,294 @@
     return wrap;
   }
 
-  // ---------- Supplies and Cats (the same lists as version 1.1) ----------
+  // ---------- Supplies (version 1.3: categories and notes) ----------
+
+  var openSupplyCats = {}; // which categories you've opened or closed (screen only)
+  var editingCategory = null; // id of the category being renamed
+  var supplyTabMessage = null; // { text, kind, markId }
+
+  function categorySelect(selectedId, label) {
+    var select = el('select', 'category-select');
+    select.name = 'category';
+    select.setAttribute('aria-label', label || 'Category');
+    state.supplyCategories.forEach(function (c) {
+      var option = el('option', '', c.name);
+      option.value = c.id;
+      select.appendChild(option);
+    });
+    select.value = selectedId || SUP.OTHER;
+    return select;
+  }
+
+  function renderSupplyItem(item) {
+    var done = item.done;
+    var li = el('li', 'item supply-item' + (done ? ' done' : ''));
+    li.dataset.id = item.id;
+    if (editing && editing.list === 'supplies' && editing.id === item.id) {
+      var form = el('form', 'supply-edit-form');
+      var name = el('input');
+      name.type = 'text';
+      name.name = 'name';
+      name.maxLength = 80;
+      name.value = item.name;
+      name.setAttribute('aria-label', 'Supply name');
+      var note = el('input');
+      note.type = 'text';
+      note.name = 'note';
+      note.maxLength = 300;
+      note.value = item.note || '';
+      note.placeholder = 'Note (optional), e.g. brand or scent';
+      note.setAttribute('aria-label', 'Note for this supply (optional)');
+      form.appendChild(name);
+      form.appendChild(note);
+      form.appendChild(categorySelect(SUP.categoryOf(state, item), 'Move to category'));
+      var save = el('button', 'btn btn-primary', 'Save Changes');
+      save.type = 'submit';
+      form.appendChild(save);
+      form.appendChild(actionButton('cancel', 'Cancel', 'Cancel editing', 'btn-quiet'));
+      li.appendChild(form);
+      return li;
+    }
+    var check = el('button', 'check', done ? '✓' : '');
+    check.type = 'button';
+    check.dataset.action = 'toggle';
+    check.setAttribute('aria-pressed', String(done));
+    check.setAttribute('aria-label', 'Mark "' + item.name + '" as ' + (done ? 'needed' : 'stocked'));
+    var body = el('div', 'item-body');
+    body.appendChild(el('span', 'item-name', item.name));
+    if (item.note) body.appendChild(el('span', 'supply-note', item.note));
+    var actions = el('div', 'item-actions');
+    actions.appendChild(actionButton('edit', 'Edit', 'Edit "' + item.name + '" (name, note, category)'));
+    actions.appendChild(actionButton('delete', 'Delete', 'Delete "' + item.name + '"', 'btn-danger'));
+    li.appendChild(check);
+    li.appendChild(body);
+    li.appendChild(actions);
+    return li;
+  }
+
+  function renderCategoryTools(category, index, total) {
+    var tools = el('div', 'category-tools');
+    if (editingCategory === category.id) {
+      var form = el('form', 'category-rename-form');
+      form.dataset.cat = category.id;
+      var input = el('input');
+      input.type = 'text';
+      input.name = 'name';
+      input.maxLength = 40;
+      input.value = category.name;
+      input.setAttribute('aria-label', 'Category name');
+      form.appendChild(input);
+      var save = el('button', 'btn btn-primary btn-compact', 'Save');
+      save.type = 'submit';
+      form.appendChild(save);
+      form.appendChild(button('cat-cancel', 'Cancel', 'btn-quiet btn-compact', { cat: category.id }));
+      tools.appendChild(form);
+      return tools;
+    }
+    var isOther = category.id === SUP.OTHER;
+    var rename = button('cat-rename', 'Rename', 'btn-small', { cat: category.id });
+    rename.setAttribute('aria-label', 'Rename category "' + category.name + '"');
+    tools.appendChild(rename);
+    if (!isOther) {
+      var up = button('cat-up', '↑', 'btn-small', { cat: category.id });
+      up.setAttribute('aria-label', 'Move "' + category.name + '" up');
+      up.disabled = index === 0;
+      var down = button('cat-down', '↓', 'btn-small', { cat: category.id });
+      down.setAttribute('aria-label', 'Move "' + category.name + '" down');
+      down.disabled = index >= total - 2; // "Other" stays last
+      var del = button('cat-delete', 'Delete', 'btn-small btn-danger', { cat: category.id });
+      del.setAttribute('aria-label', 'Delete category "' + category.name + '" (its supplies move to Other)');
+      tools.appendChild(up);
+      tools.appendChild(down);
+      tools.appendChild(del);
+    }
+    return tools;
+  }
+
+  function renderSupplies() {
+    var select = document.getElementById('add-supply-category');
+    var chosen = select.value;
+    select.textContent = '';
+    state.supplyCategories.forEach(function (c) {
+      var option = el('option', '', c.name);
+      option.value = c.id;
+      select.appendChild(option);
+    });
+    select.value = SUP.findCategory(state, chosen) ? chosen : SUP.OTHER;
+
+    var msg = document.getElementById('supply-tab-msg');
+    msg.textContent = '';
+    if (supplyTabMessage) {
+      msg.appendChild(el('p', 'supply-msg ' + supplyTabMessage.kind, supplyTabMessage.text));
+      if (supplyTabMessage.markId) msg.appendChild(button('supply-mark-needed', 'Mark as needed', 'btn-quiet btn-compact', { id: supplyTabMessage.markId }));
+    }
+
+    var box = document.getElementById('list-supplies');
+    box.textContent = '';
+    var total = state.supplyCategories.length;
+    state.supplyCategories.forEach(function (category, index) {
+      var items = SUP.itemsIn(state, category.id);
+      var c = SUP.counts(state, category.id);
+      var details = el('details', 'supply-cat');
+      details.dataset.cat = category.id;
+      details.open = openSupplyCats[category.id] !== undefined ? openSupplyCats[category.id] : c.total > 0;
+      var summary = el('summary', 'supply-cat-summary');
+      summary.appendChild(el('span', 'supply-cat-name', category.name));
+      summary.appendChild(el('span', 'supply-cat-count', c.total ? count(c.total, 'item', 'items') + (c.needed ? ' · ' + c.needed + ' needed' : '') : 'Empty'));
+      details.appendChild(summary);
+      var ul = el('ul', 'item-list');
+      if (!items.length) ul.appendChild(el('li', 'empty', 'No supplies here yet.'));
+      items.forEach(function (item) { ul.appendChild(renderSupplyItem(item)); });
+      details.appendChild(ul);
+      details.appendChild(renderCategoryTools(category, index, total));
+      details.addEventListener('toggle', function () { openSupplyCats[category.id] = details.open; });
+      box.appendChild(details);
+    });
+  }
+
+  function onSuppliesClick(event) {
+    var btn = event.target.closest('button[data-action]');
+    if (!btn || btn.disabled) return;
+    var d = btn.dataset;
+    var li = btn.closest('li[data-id]');
+    var item = li && SUP.findSupplyById(state, li.dataset.id);
+    supplyTabMessage = null;
+    switch (d.action) {
+      case 'toggle':
+        if (!item) return;
+        L.toggleSupply(item);
+        save();
+        break;
+      case 'edit':
+        editing = { list: 'supplies', id: item.id };
+        break;
+      case 'cancel':
+        editing = null;
+        break;
+      case 'delete':
+        if (!item || !window.confirm('Delete "' + item.name + '"? Chores that mention it keep their supply link.')) return;
+        state.supplies = state.supplies.filter(function (s) { return s.id !== item.id; });
+        save();
+        break;
+      case 'cat-rename':
+        editingCategory = d.cat;
+        break;
+      case 'cat-cancel':
+        editingCategory = null;
+        break;
+      case 'cat-up':
+      case 'cat-down':
+        SUP.moveCategory(state, d.cat, d.action === 'cat-up' ? -1 : 1);
+        save();
+        break;
+      case 'cat-delete':
+        var category = SUP.findCategory(state, d.cat);
+        if (!category || !window.confirm('Delete the category "' + category.name + '"? Its supplies move to Other; nothing is deleted.')) return;
+        var moved = SUP.deleteCategory(state, d.cat);
+        save();
+        supplyTabMessage = { text: 'Category deleted.' + (moved ? ' ' + count(moved, 'supply', 'supplies') + ' moved to Other.' : ''), kind: 'success' };
+        break;
+      default:
+        return;
+    }
+    render();
+    if (d.action === 'edit' || d.action === 'cat-rename') {
+      var input = document.querySelector('#list-supplies form input[type="text"]');
+      if (input) input.focus();
+    } else if (d.cat) {
+      var again = document.querySelector('#list-supplies [data-action="' + d.action + '"][data-cat="' + d.cat + '"]');
+      if (again && !again.disabled) again.focus();
+    }
+  }
+
+  function onSuppliesSubmit(event) {
+    var form = event.target;
+    event.preventDefault();
+    supplyTabMessage = null;
+    if (form.classList.contains('supply-edit-form')) {
+      var li = form.closest('li[data-id]');
+      var item = li && SUP.findSupplyById(state, li.dataset.id);
+      if (!item) return;
+      var renamed = SUP.renameSupply(state, item.id, form.elements.name.value);
+      if (!renamed.ok) {
+        supplyTabMessage = { text: renamed.reason === 'exists' ? 'Another supply already has that name.' : 'Please enter a name.', kind: 'error' };
+        render();
+        return;
+      }
+      SUP.setNote(state, item.id, form.elements.note.value);
+      SUP.moveSupply(state, item.id, form.elements.category.value);
+      openSupplyCats[SUP.categoryOf(state, item)] = true;
+      editing = null;
+      save();
+      supplyTabMessage = { text: '✓ Saved ' + item.name + '.' +
+        (renamed.linksUpdated ? ' Updated ' + count(renamed.linksUpdated, 'chore link', 'chore links') + ' to the new name.' : ''), kind: 'success' };
+    } else if (form.classList.contains('category-rename-form')) {
+      if (!SUP.renameCategory(state, form.dataset.cat, form.elements.name.value)) {
+        supplyTabMessage = { text: 'Please use a name that isn\'t blank or already used.', kind: 'error' };
+        render();
+        return;
+      }
+      editingCategory = null;
+      save();
+    }
+    render();
+  }
+
+  function onSupplyAddSubmit(event) {
+    event.preventDefault();
+    var form = event.target;
+    var result = SUP.addSupply(state, form.elements.name.value, form.elements.category.value);
+    if (!result) {
+      form.elements.name.focus();
+      return;
+    }
+    if (result.action === 'exists') {
+      var where = SUP.findCategory(state, SUP.categoryOf(state, result.supply)).name;
+      supplyTabMessage = {
+        text: '"' + result.supply.name + '" is already on your list (in ' + where + ')' + (result.supply.done ? ', ticked as stocked.' : ', marked as needed.'),
+        kind: 'info',
+        markId: result.supply.done ? result.supply.id : null
+      };
+    } else {
+      save();
+      openSupplyCats[SUP.categoryOf(state, result.supply)] = true;
+      supplyTabMessage = { text: '✓ Added ' + result.supply.name + ' to ' + SUP.findCategory(state, SUP.categoryOf(state, result.supply)).name + '.', kind: 'success' };
+      form.elements.name.value = '';
+    }
+    render();
+    form.elements.name.focus();
+  }
+
+  function onSupplyTabMessageClick(event) {
+    var btn = event.target.closest('[data-action="supply-mark-needed"]');
+    if (!btn) return;
+    var item = SUP.findSupplyById(state, btn.dataset.id);
+    if (item) {
+      item.done = false;
+      save();
+      supplyTabMessage = { text: '✓ Marked ' + item.name + ' as needed.', kind: 'success' };
+      render();
+    }
+  }
+
+  function onNewCategorySubmit(event) {
+    event.preventDefault();
+    var form = event.target;
+    var category = SUP.addCategory(state, form.elements.name.value);
+    if (!category) {
+      supplyTabMessage = { text: 'Please use a category name that isn\'t blank or already used.', kind: 'error' };
+    } else {
+      save();
+      openSupplyCats[category.id] = true;
+      supplyTabMessage = { text: '✓ Added the category ' + category.name + '.', kind: 'success' };
+      form.elements.name.value = '';
+    }
+    render();
+  }
+
+  // ---------- Cats (and the shared list code from version 1.1) ----------
 
   var LISTS = {
-    supplies: {
-      isDone: function (item) { return item.done; },
-      toggle: function (item) { L.toggleSupply(item); },
-      create: function (name) { return L.createSupply(name); },
-      empty: 'No supplies yet. Add one above.'
-    },
     pets: {
       isDone: function (item) { return L.isPetTaskDone(item, L.dayKey(new Date())); },
       toggle: function (item) { L.togglePetTask(item, L.dayKey(new Date())); },
@@ -1126,11 +1514,15 @@
   }
 
   function historyLine(o) {
-    var text = o.task.name + ' (' + roomName(o.task.room) + ')';
+    // Completed under an older name? Show the name it had, and what it's called now.
+    var then = o.record && o.record.name ? o.record.name : o.task.name;
+    var text = then + (then !== o.task.name ? ' (now "' + o.task.name + '")' : '') + ' (' + roomName(o.task.room) + ')';
     if (o.status === 'done') {
       var late = o.record.completedOn > S.weekEnd(o.effectiveWeek);
       text += ' — done ' + S.formatShort(o.record.completedOn) + (late ? ' (late)' : '');
     }
+    if (o.record && o.record.deferred && o.status !== 'done') text += ' — skipped for now';
+    if (o.record && o.record.movedTo && o.record.movedTo !== o.week) text += ' — moved to the week of ' + S.formatShort(o.record.movedTo);
     if (o.record && o.record.note) text += ' — note: "' + o.record.note + '"';
     return text;
   }
@@ -1161,7 +1553,7 @@
       var li = el('li', 'card history-item');
       var head = el('div', 'history-head');
       head.appendChild(el('span', '', S.formatShort(week) + ' – ' + S.formatShort(S.weekEnd(week))));
-      head.appendChild(el('span', '', h.done.length + ' done · ' + h.skipped.length + ' skipped · ' + h.missed.length + ' missed'));
+      head.appendChild(el('span', '', h.done.length + ' done · ' + h.missed.length + ' missed' + (h.skipped.length ? ' · ' + h.skipped.length + ' dismissed' : '')));
       li.appendChild(head);
       if (state.reviews[week]) li.appendChild(el('span', 'chip chip-reviewed', '✓ Reviewed ' + S.formatShort(state.reviews[week].updatedOn)));
       var total = h.done.length + h.missed.length;
@@ -1174,7 +1566,7 @@
           return e.name + ' (' + roomName(e.room) + ') — ' + S.formatShort(e.completedOn);
         })));
       }
-      if (h.skipped.length) details.appendChild(detailsList('Skipped', h.skipped.map(historyLine)));
+      if (h.skipped.length) details.appendChild(detailsList('Skipped (dismissed in an older version)', h.skipped.map(historyLine)));
       if (h.missed.length) details.appendChild(detailsList('Missed (still overdue)', h.missed.map(historyLine)));
       details.appendChild(el('p', 'history-group-title', 'Laundry loads finished: ' + laundry));
       li.appendChild(details);
@@ -1250,6 +1642,8 @@
     input.dataset.box = box;
     input.setAttribute('aria-label', 'Supply needed for "' + task.name + '"');
     row.appendChild(input);
+    // Optional: which Supplies category a NEW item goes in (default Other).
+    row.appendChild(categorySelect(SUP.OTHER, 'Category for a new supply'));
     var add = button('supply-add', SUPPLY_BUTTON.add, 'btn-primary btn-compact', { box: box });
     add.disabled = true; // typing alone never adds anything
     row.appendChild(add);
@@ -1274,7 +1668,8 @@
   function addSupplyFromBox(wrap) {
     var name = wrap.querySelector('.supply-name').value;
     var updated = JSON.parse(JSON.stringify(state));
-    var result = P.addOrMarkSupply(updated, name);
+    var category = wrap.querySelector('.category-select');
+    var result = P.addOrMarkSupply(updated, name, category ? category.value : null);
     if (!result || result.action === 'already') return;
     var storage = getStorage();
     if (storageMode !== 'ok' || !storage || !H.saveState(storage, updated)) {
@@ -1334,7 +1729,7 @@
     head.appendChild(el('span', 'review-item-name', o.task.name));
     var badges = el('span', 'badges');
     badges.appendChild(freqBadge(o.task.frequency));
-    if (o.status === 'overdue') badges.appendChild(el('span', 'badge status-overdue', 'Overdue from ' + S.formatShort(o.week)));
+    if (o.status === 'overdue') badges.appendChild(el('span', 'badge status-overdue', 'Overdue'));
     if (alreadyDone) badges.appendChild(el('span', 'badge status-done', '✓ Done ' + S.formatShort(o.record.completedOn) + ' via this review'));
     if (reviewRoom === 'all') badges.appendChild(el('span', 'badge', roomName(o.task.room)));
     head.appendChild(badges);
@@ -1610,7 +2005,7 @@
       renderRoomGrid();
       renderPrep();
     }
-    renderList('supplies');
+    renderSupplies();
     renderList('pets');
     renderHistory();
     renderLegacy();
@@ -1646,9 +2041,14 @@
         expanded = expanded === d.task + '|' + d.week ? null : d.task + '|' + d.week;
         changed = false;
         break;
-      case 'skip':
-        S.toggleSkip(state, d.task, d.week);
-        expanded = null;
+      case 'skip-now':
+        S.setDeferred(state, d.task, d.week, true); // stays unfinished
+        break;
+      case 'undo-skip-now':
+        S.setDeferred(state, d.task, d.week, false); // also undoes a move made after skipping
+        break;
+      case 'undo-old-skip':
+        S.toggleSkip(state, d.task, d.week); // reopens an older "dismissed" skip
         break;
       case 'save-note':
         S.setNote(state, d.task, d.week, btn.parentNode.querySelector('.note-input').value);
@@ -1661,20 +2061,24 @@
         S.moveOccurrence(state, d.task, d.week, select.value, t);
         expanded = null;
         break;
-      case 'skip-all':
-        if (!window.confirm('Skip every overdue chore in ' + roomName(openRoom) + '? They will be recorded as skipped, not done.')) return;
-        S.skipAllOverdue(state, openRoom, t);
-        break;
       case 'asneeded-done':
         if (S.lastDone(state, d.task) === t) S.undoAsNeededToday(state, d.task, t);
         else S.markAsNeededDone(state, d.task, t);
         break;
       case 'edit-task':
         editingTask = d.task;
+        editingFrom = null;
+        changed = false;
+        break;
+      case 'edit-task-inline':
+        editingTask = d.task;
+        editingFrom = d.task + '|' + d.week;
+        expanded = null;
         changed = false;
         break;
       case 'cancel-edit':
         editingTask = null;
+        editingFrom = null;
         changed = false;
         break;
       case 'delete-task':
@@ -1716,8 +2120,8 @@
     var keep = {};
     Object.keys(d).forEach(function (k) { keep[k] = d[k]; });
     render();
-    if (d.action === 'edit-task' || d.action === 'rename-load') {
-      var input = document.querySelector('#room-content form input[type="text"]:not([placeholder="Add a chore…"])');
+    if (d.action === 'edit-task' || d.action === 'edit-task-inline' || d.action === 'rename-load') {
+      var input = document.querySelector('#room-content .task-form[data-mode="edit"] input[name="name"], #room-content .rename-form input[type="text"]');
       if (input) input.focus();
     } else {
       refocus(keep);
@@ -1733,6 +2137,15 @@
       var frequency = form.elements.frequency.value;
       var anchor = form.elements.anchor.value;
       var supplies = form.elements.supplies.value;
+      if (form.dataset.mode === 'edit') {
+        // A new schedule is a bigger change than a rename: ask first.
+        var current = S.findTask(state, form.dataset.task);
+        var newAnchor = frequency === 'biweekly' ? anchor : undefined;
+        if (current && (current.frequency !== frequency || (frequency === 'biweekly' && current.anchor !== newAnchor)) &&
+            !window.confirm('Change how often "' + current.name + '" repeats? The new schedule starts this week. Past completions stay as they are.')) {
+          return;
+        }
+      }
       var ok = form.dataset.mode === 'edit'
         ? S.editTask(state, form.dataset.task, name, frequency, anchor, t, supplies)
         : S.addTask(state, openRoom, name, frequency, anchor, t, supplies);
@@ -1741,6 +2154,7 @@
         return;
       }
       editingTask = null;
+      editingFrom = null;
       save();
       render();
       if (form.dataset.mode === 'add') {
@@ -2061,15 +2475,22 @@
       else prepOpenChoice = document.getElementById('prep-card').open;
     });
 
-    Object.keys(LISTS).forEach(function (listName) {
+    ['pets'].forEach(function (listName) {
       var ul = document.getElementById('list-' + listName);
       ul.addEventListener('click', function (e) { onListClick(listName, e); });
       ul.addEventListener('submit', function (e) { onListSubmit(listName, e); });
     });
 
-    document.querySelectorAll('.add-form').forEach(function (form) {
+    document.querySelectorAll('.add-form[data-list]').forEach(function (form) {
       form.addEventListener('submit', onAddSubmit);
     });
+
+    var suppliesBox = document.getElementById('list-supplies');
+    suppliesBox.addEventListener('click', onSuppliesClick);
+    suppliesBox.addEventListener('submit', onSuppliesSubmit);
+    document.getElementById('supply-add-form').addEventListener('submit', onSupplyAddSubmit);
+    document.getElementById('supply-tab-msg').addEventListener('click', onSupplyTabMessageClick);
+    document.getElementById('new-category-form').addEventListener('submit', onNewCategorySubmit);
 
     document.querySelectorAll('.tab').forEach(function (tab) {
       tab.addEventListener('click', function () { showTab(tab.dataset.tab); });
